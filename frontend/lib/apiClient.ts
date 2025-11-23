@@ -1,6 +1,7 @@
 "use client";
 
-import { getAccessToken } from "./auth";
+// 1. Import logoutClientSide to clear credentials
+import { getAccessToken, logoutClientSide } from "./auth";
 
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_CORE_BACKEND_URL || "http://localhost:4000";
@@ -42,6 +43,18 @@ export async function apiFetch<T = any>(
     headers,
     credentials: "include"
   });
+
+  // 2. Handle Token Expiration (401 Unauthorized)
+  if (res.status === 401) {
+    logoutClientSide(); // Clear token from localStorage
+    
+    // Force redirect to login page
+    if (typeof window !== "undefined") {
+      window.location.href = "/login";
+    }
+    
+    throw new Error("Session expired. Please login again.");
+  }
 
   if (!res.ok) {
     throw await parseError(res);
