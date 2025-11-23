@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import re
+import textwrap
+import json
+from typing import List, Dict, Any
+
+from httpx import ConnectError, TimeoutException
+from app.core.config import config
+from app.core.ollama_client import ollama_client
+from app.models.schemas import SQLGenRequest, RAGMetadata, SQLGenResponse
+
+
+def _format_metadata(metadata: RAGMetadata | None) -> str:
+    """Formats schema metadata for the prompt."""
+    if metadata is None:
+        return "No explicit metadata provided."
+
+    parts: List[str] = []
+
+    if metadata.tables:
+        parts.append("Tables:")
+        for t in metadata.tables:
+            s_name = getattr(t, 'schema_name', getattr(t, 'schema', 'dbo'))
+            parts.append(f"- {s_name}.{t.name}: {t.description or ''}")
+
+    if metadata.columns:
+        parts.append("\nColumns:")
+        for c in metadata.columns:
+            parts.append(
+                f"- {c.table_schema}.{c.table_name}.{c.name} ({c.data_type or 'unknown'}): "
+                f"{c.description or ''}"
+            )
+    return "\n".join(parts)
+
+
+def _parse_month_to_num(month_name: str) -> str:
+    """Converts month names (Jan, August) to 01, 08, etc."""
+    month_map = {
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
+        'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+    }
+    return month_map.get(month_name.lower()[:3], '01')
+
+
+def _repair_sql(sql: str, nl_question: str, filters: Dict[str, Any] | None = None) -> str:
+    """
+    Aggressive Regex pipeline to fix common LLM hallucinations and syntax errors.
+    Also injects mandatory filters if the AI skipped them.
+    """
+    # 1. Remove Backticks
+    sql = sql.replace("`", "")
+
+    # 2. Fix Double Quotes
+    sql = re.sub(r'=\s*"([^"]*?)"', r"= '\1'", sql)
+    sql = re.sub(r'IN\s*\(\s*"([^"]*?)"', r"IN ('\1'", sql)
+
+    # 3. Normalize "Current Time"
+    sql = re.sub(r"(?i)\bCURRENT_DATE\b", "GETDATE()", sql)
+    sql = re.sub(r"(?i)\bCURRENT_TIMESTAMP\b", "GETDATE()", sql)
+    sql = re.sub(r"(?i)\bNOW\(\)", "GETDATE()", sql)
+
+    # 4. Fix Postgres "interval"
+    sql = re.sub(
+        r"(?i)GETDATE\(\)\s*([+-])\s*interval\s*'(\d+)\s*days?'", 
+        r"DATEADD(DAY, \1\2, GETDATE())", 
+        sql
+    )
+
+    # 5. Fix LIMIT -> TOP
+    if "LIMIT" in sql.upper():
+        match = re.search(r"LIMIT\s+(\d+)", sql, re.IGNORECASE)
+        if match:
+            limit_val = match.group(1)
+            sql = re.sub(r"LIMIT\s+\d+", "", sql, flags=re.IGNORECASE)
+            if "TOP" not in sql.upper():
+                sql = re.sub(r"(?i)SELECT\s+", f"SELECT TOP {limit_val} ", sql, count=1)
+
+    # Fix: Remove "TOP (...) PERCENT" from end of query
+    sql = re.sub(r"(?i)\s+TOP\s+\(?\d+\)?\s+PERCENT", "", sql)
+    # Fix: Remove "TOP ..." if it appears after ORDER BY
+    sql = re.sub(r"(?i)ORDER\s+BY\s+.*?\s+(TOP\s+\d+)", "", sql)
+
+    # 6. Fix NULLS LAST
+    sql = re.sub(r"(?i)\s+NULLS\s+(LAST|FIRST)", "", sql)
+
+    # 7. Fix ILIKE -> LIKE
+    sql = sql.replace(" ilike ", " LIKE ").replace(" ILIKE ", " LIKE ")
+
+    # 8. Remove Conflicting "Default" Filters
+    if "YEAR(" in sql or "FORMAT(" in sql:
+        sql = re.sub(r"(?i)AND\s+(\w+\.)?DataCollectionDate\s*>=\s*DATEADD\(.*?\)", "", sql)
+        sql = re.sub(r"(?i)AND\s+(\w+\.)?DataCollectionDate\s*>=\s*GETDATE\(.*?\)", "", sql)
+        sql = sql.replace("WHERE AND", "WHERE").replace("AND AND", "AND")
+
+    # 9. Remove Unwanted TOP 1
+    ranking_keywords = ['top', 'highest', 'lowest', 'best', 'worst', 'most', 'least', 'first', 'last', 'rank', 'limit', 'peak']
+    is_ranking_requested = any(kw in nl_question.lower() for kw in ranking_keywords)
+    if not is_ranking_requested:
+        sql = re.sub(r"(?i)SELECT\s+TOP\s+\d+\s+", "SELECT ", sql)
+
+    # 10. Inject Missing Grouping Column into SELECT
+    if "GROUP BY FORMAT(DataCollectionDate, 'yyyy-MM')" in sql:
+        if "FORMAT(DataCollectionDate, 'yyyy-MM')" not in sql.split("FROM")[0]:
+            sql = re.sub(
+                r"(?i)SELECT\s+(TOP\s+\d+\s+)?", 
+                r"SELECT \1FORMAT(DataCollectionDate, 'yyyy-MM') AS [Month], ", 
+                sql
+            )
+
+    # 11. Remove Hallucinated Columns
+    sql = re.sub(r",\s*(?<!\[)\b(Month|Year|Day)\b\s*,", ",", sql, flags=re.IGNORECASE)
+    sql = re.sub(r",\s*(?<!\[)\b(Month|Year|Day)\b\s+FROM", " FROM", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"SELECT\s+(?<!\[)\b(Month|Year|Day)\b\s*,", "SELECT ", sql, flags=re.IGNORECASE)
+
+    # -------------------------------------------------------------------------
+    # 12. CRITICAL FIX: Force Inject Missing Filters (from JSON)
+    # -------------------------------------------------------------------------
+    if filters:
+        for col, val in filters.items():
+            # If the column name is not present in the SQL (ignoring alias prefix)
+            # We simply check if the string "DeviceName" appears in the query
+            if col not in sql:
+                val_str = f"'{val}'" if isinstance(val, str) else str(val)
+                condition = f"{col} = {val_str}"
+                
+                if "WHERE" in sql.upper():
+                    sql = re.sub(r"(?i)WHERE\s+", f"WHERE {condition} AND ", sql)
+                elif "GROUP BY" in sql.upper():
+                    sql = sql.replace("GROUP BY", f"WHERE {condition} GROUP BY")
+                elif "ORDER BY" in sql.upper():
+                    sql = sql.replace("ORDER BY", f"WHERE {condition} ORDER BY")
+                else:
+                    sql += f" WHERE {condition}"
+
+    # 13. FLATTEN QUERY (Remove Newlines)
+    sql = re.sub(r'\s+', ' ', sql).strip()
+
+    # 14. Remove Trailing Semicolon
+    sql = sql.rstrip(";")
+
+    return sql
+
+
+async def generate_sql(request: SQLGenRequest) -> SQLGenResponse:
+    
+    metadata_block = _format_metadata(request.metadata)
+    nl_text = request.natural_language
+    nl_lower = nl_text.lower()
+
+    # ------------------------------------------------------------------
+    # 1. TIME FILTER LOGIC
+    # ------------------------------------------------------------------
+    time_hint = ""
+
+    last_x_months_year = re.search(r"last\s+(\d+)\s+months?\s+(?:of\s+)?(\d{4})", nl_lower)
+    all_years = re.findall(r"\b(20[2-3]\d)\b", nl_text)
+    all_months = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b", nl_text, re.IGNORECASE)
+    exact_dates = re.findall(r"(\d{4}-\d{2}-\d{2})", nl_text)
+    is_range_request = re.search(r"\b(to|through|until)\b", nl_lower)
+    is_today_request = re.search(r"\b(today)\b", nl_lower)
+
+    if is_today_request:
+        time_hint = "FILTER RULE: User asked for 'Today'. Use: `DataCollectionDate >= CAST(GETDATE() AS DATE)`."
+    elif last_x_months_year:
+        # "Last 3 months of 2025"
+        count = int(last_x_months_year.group(1))
+        year = last_x_months_year.group(2)
+        start_month = 12 - count + 1
+        time_hint = (
+            f"FILTER RULE: User asked for the last {count} months of {year}. "
+            f"You MUST use: `YEAR(DataCollectionDate) = {year} AND MONTH(DataCollectionDate) >= {start_month}`. "
+            "DO NOT use DATEADD. DO NOT use HAVING."
+        )
+    elif (all_months and all_years) and not is_range_request:
+        targets = []
+        unique_years = sorted(list(set(all_years)))
+        target_year = unique_years[0]
+        for m in set(all_months): 
+            m_num = _parse_month_to_num(m)
+            targets.append(f"'{target_year}-{m_num}'")
+        target_list_str = ", ".join(targets)
+        time_hint = (
+            f"FILTER RULE: User wants specific months: {target_list_str}. "
+            f"Use EXACTLY: `FORMAT(DataCollectionDate, 'yyyy-MM') IN ({target_list_str})`. "
+            "DO NOT add any other date filters."
+        )
+    elif all_years and not all_months and not exact_dates:
+        year_list = ", ".join(list(set(all_years)))
+        time_hint = f"FILTER RULE: User asked for year(s): {year_list}. Use `YEAR(DataCollectionDate) IN ({year_list})`."
+    elif exact_dates:
+        time_hint = f"FILTER RULE: Specific dates detected: {', '.join(exact_dates)}. Use standard date comparison."
+    elif request.time_range:
+        if request.time_range.lower() == "today":
+             time_hint = "FILTER RULE: User asked for 'Today'. Use `DataCollectionDate >= CAST(GETDATE() AS DATE)`."
+        else:
+             time_hint = f"FILTER RULE: Context hint is '{request.time_range}'. Use DATEADD."
+    else:
+        time_hint = "FILTER RULE: Default to last 7 days: `DataCollectionDate >= DATEADD(DAY, -7, GETDATE())`."
+
+    # ------------------------------------------------------------------
+    # 2. GROUPING & FORMATTING RULES
+    # ------------------------------------------------------------------
+    grouping_rule = "GROUPING RULE: None. Return scalar aggregate."
+    if "monthly" in nl_lower:
+        grouping_rule = (
+            "GROUPING RULE (Format: YYYY-MM):\n"
+            "1. SELECT `FORMAT(DataCollectionDate, 'yyyy-MM') AS [Month]` AND the Aggregate.\n"
+            "2. GROUP BY `FORMAT(DataCollectionDate, 'yyyy-MM')`."
+        )
+    elif "daily" in nl_lower:
+        grouping_rule = (
+            "GROUPING RULE (Format: YYYY-MM-DD):\n"
+            "1. SELECT `FORMAT(DataCollectionDate, 'yyyy-MM-dd') AS [Day]` AND the Aggregate.\n"
+            "2. GROUP BY `FORMAT(DataCollectionDate, 'yyyy-MM-dd')`."
+        )
+    elif "yearly" in nl_lower:
+        grouping_rule = (
+            "GROUPING RULE (Format: YYYY):\n"
+            "1. SELECT `FORMAT(DataCollectionDate, 'yyyy') AS [Year]` AND the Aggregate.\n"
+            "2. GROUP BY `FORMAT(DataCollectionDate, 'yyyy')`."
+        )
+    elif "hourly" in nl_lower:
+        grouping_rule = (
+            "GROUPING RULE (Format: dd HH):\n"
+            "1. SELECT `FORMAT(DataCollectionDate, 'dd HH') AS [Hour]` AND the Aggregate.\n"
+            "2. GROUP BY `FORMAT(DataCollectionDate, 'dd HH')`."
+        )
+
+    # ------------------------------------------------------------------
+    # 3. AGGREGATION RULES
+    # ------------------------------------------------------------------
+    agg_hint = "AGGREGATION RULE: Use `AVG(DataValue)` by default."
+    if any(x in nl_lower for x in ["sum", "total"]): agg_hint = "AGGREGATION RULE: Use `SUM(DataValue)`."
+    elif any(x in nl_lower for x in ["max", "peak", "highest", "spike"]): agg_hint = "AGGREGATION RULE: Use `MAX(DataValue)`."
+    elif any(x in nl_lower for x in ["min", "lowest"]): agg_hint = "AGGREGATION RULE: Use `MIN(DataValue)`."
+    elif any(x in nl_lower for x in ["count", "number of"]): agg_hint = "AGGREGATION RULE: Use `COUNT(*)`."
+
+    # ------------------------------------------------------------------
+    # 4. SYSTEM PROMPT
+    # ------------------------------------------------------------------
+    # Ensure filters are explicitly requested in the prompt, even if Python injection fails
+    filter_instruction = ""
+    if request.filters:
+        filter_instruction = f"MANDATORY FILTERS: Apply these EXACT filters in the WHERE clause: {json.dumps(request.filters)}."
+    else:
+        filter_instruction = "MANDATORY FILTERS: If the question mentions a Server/Device (e.g. 'SRV-01'), you MUST filter by `DeviceName`."
+
+    prompt = f"""### Instructions
+Convert the user's question into a valid T-SQL query for SQL Server.
+
+HARD REQUIREMENTS:
+- **Schema Strictness:** ONLY use columns from the Schema below.
+- **Structure:** Follow the GROUPING RULE strictly.
+- **Filter:** Follow the FILTER RULE.
+- **Entities:** You MUST filter by specific server/device names if mentioned.
+- **Syntax:** Use `TOP n`, `DATEADD`, `GETDATE()`, `FORMAT()`. NO `interval`.
+
+### Schema
+{metadata_block}
+
+### Question
+{request.natural_language}
+
+### Execution Plan
+1. {time_hint}
+2. {grouping_rule}
+3. {agg_hint}
+4. {f"Metric: {request.metric_type}" if request.metric_type else ""}
+5. {filter_instruction}
+
+### Query
+SELECT"""
+
+    # ------------------------------------------------------------------
+    # 5. EXECUTE & REPAIR
+    # ------------------------------------------------------------------
+    try:
+        raw = await ollama_client.generate(model=config.SQL_MODEL, prompt=prompt)
+    except (ConnectError, TimeoutException) as e:
+        return SQLGenResponse(
+            generated_sql="", 
+            reasoning="AI Service Unavailable", 
+            warnings=[f"Connection error: {str(e)}"]
+        )
+
+    sql = raw.strip()
+    
+    if "```" in sql:
+        parts = sql.split("```")
+        if len(parts) >= 2:
+            sql = parts[1].replace("sql", "", 1).strip()
+
+    if not sql.upper().startswith("SELECT") and not sql.upper().startswith("WITH"):
+        idx = sql.upper().find("SELECT")
+        if idx >= 0:
+            sql = sql[idx:]
+        else:
+            sql = "SELECT " + sql
+
+    # Apply Regex Repairs AND Force Filter Injection
+    final_sql = _repair_sql(sql, request.natural_language, request.filters)
+
+    return SQLGenResponse(
+        generated_sql=final_sql,
+        reasoning="Reasoning not provided (SQLCoder mode)",
+        warnings=[]
+    )
