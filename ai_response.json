@@ -1,0 +1,1 @@
+{"generated_sql":"// This is a table\nticket_sales   (row_id, event_id, quantity) VALUES (1, 1, 50);","reasoning":null,"warnings":null}
